@@ -38,17 +38,12 @@ func NewConfig(server, origin string) (config *Config, err error) {
 	return
 }
 
-// NewClient creates a new WebSocket client connection over rwc.
-func NewClient(config *Config, rwc io.ReadWriteCloser) (ws *Conn, err error) {
-	br := bufio.NewReader(rwc)
-	bw := bufio.NewWriter(rwc)
-	err = hybiClientHandshake(config, br, bw)
-	if err != nil {
-		return
-	}
-	buf := bufio.NewReadWriter(br, bw)
-	ws = newHybiClientConn(config, buf, rwc)
-	return
+func ClientHandshake(config *Config, rw *bufio.ReadWriter) error {
+	return hybiClientHandshake(config, rw.Reader, rw.Writer)
+}
+
+func NewClientConn(rwc io.ReadWriteCloser, buf *bufio.ReadWriter, c *Config) *Conn {
+	return newHybiClientConn(c, buf, rwc)
 }
 
 // Dial opens a new client connection to a WebSocket.
@@ -77,30 +72,38 @@ func parseAuthority(location *url.URL) string {
 	return location.Host
 }
 
-// DialConfig opens a new client connection to a WebSocket with a config.
-func DialConfig(config *Config) (ws *Conn, err error) {
-	var client net.Conn
+func DialConfigRaw(config *Config) (net.Conn, *bufio.ReadWriter, error) {
 	if config.Location == nil {
-		return nil, &DialError{config, ErrBadWebSocketLocation}
+		return nil, nil, &DialError{config, ErrBadWebSocketLocation}
 	}
 	if config.Origin == nil {
-		return nil, &DialError{config, ErrBadWebSocketOrigin}
+		return nil, nil, &DialError{config, ErrBadWebSocketOrigin}
 	}
+
 	dialer := config.Dialer
 	if dialer == nil {
 		dialer = &net.Dialer{}
 	}
-	client, err = dialWithDialer(dialer, config)
+	conn, err := dialWithDialer(dialer, config)
 	if err != nil {
-		goto Error
+		return nil, nil, err
 	}
-	ws, err = NewClient(config, client)
-	if err != nil {
-		client.Close()
-		goto Error
-	}
-	return
 
-Error:
-	return nil, &DialError{config, err}
+	br := bufio.NewReader(conn)
+	bw := bufio.NewWriter(conn)
+	err = hybiClientHandshake(config, br, bw)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return conn, bufio.NewReadWriter(br, bw), nil
+}
+
+// DialConfig opens a new client connection to a WebSocket with a config.
+func DialConfig(config *Config) (ws *Conn, err error) {
+	client, rw, err := DialConfigRaw(config)
+	if err != nil {
+		return nil, &DialError{config, err}
+	}
+	return NewClientConn(client, rw, config), nil
 }

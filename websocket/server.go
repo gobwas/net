@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"time"
 )
 
 var ErrNoHijacker = fmt.Errorf("ResponseWriter does not implement http.Hijacker interface")
@@ -25,6 +26,8 @@ func upgrade(r *http.Request, w http.ResponseWriter, hs serverHandshaker, handsh
 	if err != nil {
 		return
 	}
+	// Cleanup deadlines.
+	conn.SetDeadline(time.Time{})
 
 	code, err := hs.ReadHandshake(buf.Reader, r)
 	if err == ErrBadWebSocketVersion {
@@ -72,9 +75,8 @@ func Upgrade(r *http.Request, w http.ResponseWriter, c *Config, handshake Handsh
 }
 
 // NewServerConn wraps upgraded rwc into Conn.
-func NewServerConn(rwc io.ReadWriteCloser, buf *bufio.ReadWriter, r *http.Request, c *Config) *Conn {
-	hs := &hybiServerHandshaker{Config: c}
-	return hs.NewServerConn(buf, rwc, r)
+func NewServerConn(rwc io.ReadWriteCloser, buf *bufio.ReadWriter, c *Config) *Conn {
+	return newHybiServerConn(c, buf, rwc)
 }
 
 // Server represents a server of a WebSocket.
@@ -107,7 +109,7 @@ func (s Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	// specification.
 	defer rwc.Close()
 
-	conn := hs.NewServerConn(buf, rwc, r)
+	conn := hs.NewServerConn(buf, rwc)
 	if conn == nil {
 		panic("unexpected nil conn")
 	}

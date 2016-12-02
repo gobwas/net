@@ -109,7 +109,7 @@ type serverHandshaker interface {
 	AcceptHandshake(buf *bufio.Writer) (err error)
 
 	// NewServerConn creates a new WebSocket connection.
-	NewServerConn(buf *bufio.ReadWriter, rwc io.ReadWriteCloser, request *http.Request) (conn *Conn)
+	NewServerConn(buf *bufio.ReadWriter, rwc io.ReadWriteCloser) (conn *Conn)
 
 	// HandshakeConfig returns handshaker configuration.
 	HandshakeConfig() *Config
@@ -153,17 +153,20 @@ type frameWriterFactory interface {
 type frameHandler interface {
 	HandleFrame(frame frameReader) (r frameReader, err error)
 	WriteClose(status int) (err error)
+	WritePing(msg []byte) (n int, err error)
+	WritePong(msg []byte) (n int, err error)
 }
 
 // Conn represents a WebSocket connection.
 //
 // Multiple goroutines may invoke methods on a Conn simultaneously.
 type Conn struct {
-	config  *Config
-	request *http.Request
+	config *Config
+	server bool
 
-	buf *bufio.ReadWriter
-	rwc io.ReadWriteCloser
+	rbuf *bufio.Reader
+	wbuf *bufio.Writer
+	rwc  io.ReadWriteCloser
 
 	rio sync.Mutex
 	frameReaderFactory
@@ -181,38 +184,126 @@ type Conn struct {
 	MaxPayloadBytes int
 }
 
+var ErrBuffered = errors.New("underlying buffer has buffered bytes")
+
+func (ws *Conn) SetReadBuffer(r *bufio.Reader) error {
+	ws.rio.Lock()
+	defer ws.rio.Unlock()
+
+	if ws.rbuf != nil && ws.rbuf.Buffered() > 0 {
+		return ErrBuffered
+	}
+
+	if r != nil {
+		ws.frameReaderFactory = hybiFrameReaderFactory{r}
+	} else {
+		ws.frameReaderFactory = nil
+	}
+	ws.rbuf = r
+
+	return nil
+}
+
+func (ws *Conn) SetWriteBuffer(w *bufio.Writer) error {
+	ws.wio.Lock()
+	defer ws.wio.Unlock()
+
+	if ws.wbuf != nil && ws.wbuf.Buffered() > 0 {
+		return ErrBuffered
+	}
+
+	if w != nil {
+		ws.frameWriterFactory = hybiFrameWriterFactory{w, !ws.server}
+	} else {
+		ws.frameWriterFactory = nil
+	}
+	ws.wbuf = w
+
+	return nil
+}
+
+func (ws *Conn) frame() (frame frameReader, err error) {
+	frame, err = ws.NewFrameReader()
+	if err != nil {
+		return
+	}
+	return ws.HandleFrame(frame)
+}
+
+func (ws *Conn) payload() (frame frameReader, err error) {
+	for {
+		frame, err = ws.frame()
+		if err != nil || frame != nil {
+			return
+		}
+	}
+}
+
+func (ws *Conn) Frame() (io.Reader, error) {
+	ws.rio.Lock()
+	defer ws.rio.Unlock()
+	return ws.frame()
+}
+
 // Read implements the io.Reader interface:
 // it reads data of a frame from the WebSocket connection.
 // if msg is not large enough for the frame data, it fills the msg and next Read
 // will read the rest of the frame data.
-// it reads Text frame or Binary frame.
+// It reads Text frame or Binary frame.
+// It returns 0, io.EOF on conn closed or empty payload frame received.
 func (ws *Conn) Read(msg []byte) (n int, err error) {
 	ws.rio.Lock()
 	defer ws.rio.Unlock()
-again:
+
 	if ws.frameReader == nil {
-		frame, err := ws.frameReaderFactory.NewFrameReader()
+		ws.frameReader, err = ws.payload()
 		if err != nil {
 			return 0, err
-		}
-		ws.frameReader, err = ws.frameHandler.HandleFrame(frame)
-		if err != nil {
-			return 0, err
-		}
-		if ws.frameReader == nil {
-			goto again
 		}
 	}
+
 	n, err = ws.frameReader.Read(msg)
 	if err == io.EOF {
 		if trailer := ws.frameReader.TrailerReader(); trailer != nil {
 			io.Copy(ioutil.Discard, trailer)
 		}
 		ws.frameReader = nil
-		goto again
 	}
-	return n, err
+	return
 }
+
+// Read implements the io.Reader interface:
+// it reads data of a frame from the WebSocket connection.
+// if msg is not large enough for the frame data, it fills the msg and next Read
+// will read the rest of the frame data.
+// it reads Text frame or Binary frame.
+//func (ws *Conn) Read(msg []byte) (n int, err error) {
+//	ws.rio.Lock()
+//	defer ws.rio.Unlock()
+//again:
+//	if ws.frameReader == nil {
+//		frame, err := ws.frameReaderFactory.NewFrameReader()
+//		if err != nil {
+//			return 0, err
+//		}
+//		ws.frameReader, err = ws.frameHandler.HandleFrame(frame)
+//		if err != nil {
+//			return 0, err
+//		}
+//		if ws.frameReader == nil {
+//			goto again
+//		}
+//	}
+//	n, err = ws.frameReader.Read(msg)
+//	if err == io.EOF {
+//		if trailer := ws.frameReader.TrailerReader(); trailer != nil {
+//			io.Copy(ioutil.Discard, trailer)
+//		}
+//		ws.frameReader = nil
+//		goto again
+//	}
+//	return n, err
+//}
 
 // Write implements the io.Writer interface:
 // it writes data as a frame to the WebSocket connection.
@@ -238,8 +329,8 @@ func (ws *Conn) Close() error {
 	return err1
 }
 
-func (ws *Conn) IsClientConn() bool { return ws.request == nil }
-func (ws *Conn) IsServerConn() bool { return ws.request != nil }
+func (ws *Conn) IsClientConn() bool { return !ws.server }
+func (ws *Conn) IsServerConn() bool { return ws.server }
 
 // LocalAddr returns the WebSocket Origin for the connection for client, or
 // the WebSocket location for server.
@@ -287,10 +378,6 @@ func (ws *Conn) SetWriteDeadline(t time.Time) error {
 
 // Config returns the WebSocket config.
 func (ws *Conn) Config() *Config { return ws.config }
-
-// Request returns the http request upgraded to the WebSocket.
-// It is nil for client side.
-func (ws *Conn) Request() *http.Request { return ws.request }
 
 // Codec represents a symmetric pair of functions that implement a codec.
 type Codec struct {

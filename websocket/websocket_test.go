@@ -52,6 +52,7 @@ func countServer(ws *Conn) {
 	}
 }
 
+// TODO(gobwas): remove this struct cause now hybiFrameHandler has WritePing.
 type testCtrlAndDataHandler struct {
 	hybiFrameHandler
 }

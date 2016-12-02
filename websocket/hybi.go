@@ -235,6 +235,7 @@ func (frame *hybiFrameWriter) Write(msg []byte) (n int, err error) {
 		err = frame.writer.Flush()
 		return length, err
 	}
+
 	frame.writer.Write(header)
 	frame.writer.Write(msg)
 	err = frame.writer.Flush()
@@ -331,20 +332,35 @@ func (handler *hybiFrameHandler) WritePong(msg []byte) (n int, err error) {
 	return n, err
 }
 
-// newHybiConn creates a new WebSocket connection speaking hybi draft protocol.
-func newHybiConn(config *Config, buf *bufio.ReadWriter, rwc io.ReadWriteCloser, request *http.Request) *Conn {
-	if buf == nil {
-		br := bufio.NewReader(rwc)
-		bw := bufio.NewWriter(rwc)
-		buf = bufio.NewReadWriter(br, bw)
+func (handler *hybiFrameHandler) WritePing(msg []byte) (n int, err error) {
+	handler.conn.wio.Lock()
+	defer handler.conn.wio.Unlock()
+	w, err := handler.conn.frameWriterFactory.NewFrameWriter(PingFrame)
+	if err != nil {
+		return 0, err
 	}
-	ws := &Conn{config: config, request: request, buf: buf, rwc: rwc,
-		frameReaderFactory: hybiFrameReaderFactory{buf.Reader},
-		frameWriterFactory: hybiFrameWriterFactory{
-			buf.Writer, request == nil},
-		PayloadType:        TextFrame,
-		defaultCloseStatus: closeStatusNormal}
+	n, err = w.Write(msg)
+	w.Close()
+	return n, err
+}
+
+// newHybiConn creates a new WebSocket connection speaking hybi draft protocol.
+func newHybiConn(config *Config, buf *bufio.ReadWriter, rwc io.ReadWriteCloser, isServer bool) *Conn {
+	ws := &Conn{
+		PayloadType: TextFrame,
+
+		config: config,
+		server: isServer,
+		rwc:    rwc,
+
+		defaultCloseStatus: closeStatusNormal,
+	}
+	if buf != nil {
+		ws.SetReadBuffer(buf.Reader)
+		ws.SetWriteBuffer(buf.Writer)
+	}
 	ws.frameHandler = &hybiFrameHandler{conn: ws}
+
 	return ws
 }
 
@@ -478,7 +494,7 @@ func hybiClientHandshake(config *Config, br *bufio.Reader, bw *bufio.Writer) (er
 
 // newHybiClientConn creates a client WebSocket connection after handshake.
 func newHybiClientConn(config *Config, buf *bufio.ReadWriter, rwc io.ReadWriteCloser) *Conn {
-	return newHybiConn(config, buf, rwc, nil)
+	return newHybiConn(config, buf, rwc, false)
 }
 
 // A HybiServerHandshaker performs a server handshake using hybi draft protocol.
@@ -577,11 +593,11 @@ func (c *hybiServerHandshaker) HandshakeConfig() *Config {
 	return c.Config
 }
 
-func (c *hybiServerHandshaker) NewServerConn(buf *bufio.ReadWriter, rwc io.ReadWriteCloser, request *http.Request) *Conn {
-	return newHybiServerConn(c.Config, buf, rwc, request)
+func (c *hybiServerHandshaker) NewServerConn(buf *bufio.ReadWriter, rwc io.ReadWriteCloser) *Conn {
+	return newHybiServerConn(c.Config, buf, rwc)
 }
 
 // newHybiServerConn returns a new WebSocket connection speaking hybi draft protocol.
-func newHybiServerConn(config *Config, buf *bufio.ReadWriter, rwc io.ReadWriteCloser, request *http.Request) *Conn {
-	return newHybiConn(config, buf, rwc, request)
+func newHybiServerConn(config *Config, buf *bufio.ReadWriter, rwc io.ReadWriteCloser) *Conn {
+	return newHybiConn(config, buf, rwc, true)
 }
